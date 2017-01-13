@@ -1,3 +1,4 @@
+#!/usr/bin/env fish
 # Pathogen Helpers for Fish
 # These commands allow for easy management of pathogen (vim) plugins
 # Copyright 2015 Roman Hargrave <roman@hargrave.info>
@@ -17,6 +18,13 @@ set -q PATHOGEN_BUNDLES; or set -g PATHOGEN_BUNDLES $HOME/.vim/bundle
 set -q PATHOGEN_BUNDLES_DISABLED; or set -g PATHOGEN_BUNDLES_DISABLED $HOME/.vim/bundle.available
 
 test -d $PATHOGEN_BUNDLES_DISABLED; or mkdir -p $PATHOGEN_BUNDLES_DISABLED ^ /dev/null
+
+# Make sure we are calling _real_ git by unsetting any function that overrides it
+# procedure git-test {{{
+if functions -q git
+    functions -e git
+end
+# }}}
 
 # namespace pathogen {{{
 # General-purpous helpers
@@ -57,11 +65,11 @@ end
 function pathogen.plugin.needs_update -d 'Return true if a plugin needs to be updated' -a 'path'
 	if pathogen.is_git_repo $path
 		set -x GIT_DIR $path
-		git fetch remote > /dev/null ^ /dev/null
-		set -l local (git rev-parse @)
-		set -l base (git merge-base @ '@{u}')
+		git fetch origin --tags
+		set -l current_rev  (git rev-parse HEAD)
+		set -l remote_rev   (git rev-parse FETCH_HEAD)
 		set -e GIT_DIR	
-		return (test local -eq base)
+		return (test $current_rev -eq $remote_rev)
 	else
 		return 1
 	end
@@ -88,7 +96,7 @@ function pathogen.install --description 'Wrapper for entering ~/.vim/autoload an
 
 	printf "Fetching plugin: "
 	# Clone repository
-	git clone --recursive $argv 2>&1 | cat > $statusfile
+	git clone --recursive $argv 2>&1 > $statusfile
 	set -l git_status $status
 
 	if test $git_status = 0
@@ -115,17 +123,21 @@ function pathogen.update.prefix
 end
 
 function pathogen.update.log_file -a 'prefix'
-	set -l _path "$prefix/pathogen_update.log"
+	set -l _path (realpath "$prefix/pathogen_update.log")
 	touch $_path
 	echo $_path
 end
 
-function pathogen.update.log -a 'message'
-	echo (pathogen.update.prefix) "$message" >> (pathogen.update.log_file $PWD)
+function -S pathogen.update.log -a 'message'
+	echo (pathogen.update.prefix) "$message" >> $_UPDATE_LOGFILE
 end
 
-function pathogen.update.log.format_stdin
-	awk '$0="'(pathogen.update.prefix)' "$0'
+function -S pathogen.update.log.format_stdin
+	cat | string replace -ra '^(.*)$' (pathogen.update.prefix)' $0'  
+end
+
+function -S pathogen.update.log.stdin
+    pathogen.update.log.format_stdin >> $_UPDATE_LOGFILE
 end
 
 # }}}
@@ -145,7 +157,7 @@ function pathogen.update --description 'Wrapper for updating pathogen plugins' #
 		# Determine real paths for user-specified plugins
 		for plugin in $argv
 			if pathogen.plugin.exists $plugin
-				if pathogen.plugin_is_disabled "$plugin"
+				if pathogen.plugin.is_disabled "$plugin"
 					set _plugins "$PATHOGEN_BUNDLES_DISABLED/$plugin"
 				else
 					set _plugins "$PATHOGEN_BUNDLES/$plugin"
@@ -178,47 +190,73 @@ function pathogen.update --description 'Wrapper for updating pathogen plugins' #
 		return 2
 	else
 		for plugin in $plugins
-			printf "Updating "(basename $plugin)": " 
+			echo "Updating "(basename $plugin) 
 			
 			# hack to remove trailing slash
-			set -l logfile (pathogen.update.log_file $plugin)
+            set -x _UPDATE_LOGFILE (pathogen.update.log_file $plugin)
 
 			# Enter plugin directory
-			set -x GIT_DIR $plugin
+            set -x GIT_DIR          (realpath $plugin)/.git
+            set -x GIT_WORK_TREE    (realpath $plugin)
+            set _git_status         0 0
 
 			if test $fetch_only = 0
 				pathogen.update.log "Fetching remote objects"
-				git fetch ^&1 | pathogen.update.log.format_stdin >> $logfile
-				or pathogen.update.log "Fetch failed"
-				set_color green
-				echo OK
+
+                # This trickery is a clever hack to prevent pathogen.update.log.stdin from tainting the return status 
+				begin
+                    git fetch
+                    set _git_status[1] $status ^/dev/null
+                end ^&1 | pathogen.update.log.stdin
+
+				if test $_git_status[1] = 0 
+                    set_color green
+                    echo OK
+                else
+                    set_color red
+                    echo "Failed (Git: $_git_status[1])"
+                    pathogen.update.log "Fetch failed with exit status $_git_status"
+                end
+
 			else
 				pathogen.update.log "Starting Update"
 
-				git pull ^&1 | pathogen.update.log.format_stdin >> $logfile
-				set -l git_status $status
-				git submodule foreach git pull ^&1 | pathogen.update.log.format_stdin >> $logfile
-				set git_status $git_status $status
+				begin
+                    git pull
+                    set _git_status[1] $status ^/dev/null
+                end ^&1 | pathogen.update.log.stdin 
 
-				pathogen.update.log "Update finished with exit status $git_status[1]"
+                printf '┣ git pull: '
+                switch $_git_status[1]
+                    case 0
+                        set_color green 
+                        echo OK
+                    case '*'
+                        set_color red
+                        echo "Failed (Git: $_git_status[1])"
+                end
+                set_color normal
 
-				test $git_status[2] = 0; or pathogen.update.log "Warning: submodule update did not exit successfully"
+				begin
+                    git submodule foreach git pull
+                    set _git_status[2] $status ^/dev/null
+                end ^&1 | pathogen.update.log.stdin 
 
-				switch $git_status[1]
-					case 0
-						set_color green
-						echo "OK"
-						if test $git_status[2] != 0
-							set_color yellow
-							echo "Note: Submodule update failed"
-						end
-					case '*'
-						set_color red
-						echo "error. see $logfile for details"
-				end
+                printf '┗ git submodule foreach git pull: '
+                switch $_git_status[2]
+                    case 0
+                        set_color green
+                        echo OK
+                    case '*'
+                        set_color red
+                        echo  "Failed (Git: $_git_status[2])"
+                end
+
+				pathogen.update.log "Update finished with exit status $_git_status[1]"
 			end
 
 			set -e GIT_DIR
+            set -e GIT_WORK_TREE
 
 			set_color normal
 		end
@@ -226,7 +264,8 @@ function pathogen.update --description 'Wrapper for updating pathogen plugins' #
 end # }}}
 
 function pathogen.list_plugins --description "List pathogen plugins" # {{{
-	
+    set -l _col_width 24
+
 	contains -- --fetch $argv
 	set -l update_repos $status
 
@@ -250,7 +289,7 @@ function pathogen.list_plugins --description "List pathogen plugins" # {{{
 		set_color normal
 
 		# I hope you don't have a plugin with >24 characters in the name, seeing as the column utility was designed by satan himself.
-		printf "%-24s\t\n" (basename $file)
+		printf "%-"$_col_width"s\t\n" (basename $file)
 	end | column
 end # }}}
 
@@ -433,3 +472,5 @@ function pathogen --description "Pathogen helper command" -a 'action'
 
 	return $status
 end
+
+pathogen $argv
