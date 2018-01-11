@@ -57,11 +57,11 @@ end
 function pathogen.plugin.needs_update -d 'Return true if a plugin needs to be updated' -a 'path'
 	if pathogen.is_git_repo $path
 		set -x GIT_DIR $path
-		git fetch remote > /dev/null ^ /dev/null
-		set -l local (git rev-parse @)
-		set -l base (git merge-base @ '@{u}')
+		git fetch origin --tags
+		set -l current_rev  (git rev-parse HEAD)
+		set -l remote_rev   (git rev-parse FETCH_HEAD)
 		set -e GIT_DIR	
-		return (test local -eq base)
+		return (test $current_rev -eq $remote_rev)
 	else
 		return 1
 	end
@@ -88,7 +88,7 @@ function pathogen.install --description 'Wrapper for entering ~/.vim/autoload an
 
 	printf "Fetching plugin: "
 	# Clone repository
-	git clone --recursive $argv 2>&1 | cat > $statusfile
+	git clone --recursive $argv 2>&1 > $statusfile
 	set -l git_status $status
 
 	if test $git_status = 0
@@ -125,7 +125,7 @@ function pathogen.update.log -a 'message'
 end
 
 function pathogen.update.log.format_stdin
-	awk '$0="'(pathogen.update.prefix)' "$0'
+	string replace -ra '^(.*)$' (pathogen.update.prefix)' $0'
 end
 
 # }}}
